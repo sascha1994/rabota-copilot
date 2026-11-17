@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+search.json
+data/
+output/pdf/
+*.egg-info/
+build/
+dist/
+
+*.bot.lock
+python_rabota_by_all_in_one_docker.html
+

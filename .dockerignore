@@ -1,0 +1,6 @@
+**
+!Dockerfile
+!requirements.lock
+!search.example.json
+!app/
+!app/*.py

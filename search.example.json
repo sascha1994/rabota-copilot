@@ -1,0 +1,14 @@
+{
+  "text": "Дизайнер",
+  "areas": [],
+  "experience": null,
+  "salary": null,
+  "currency": "BYR",
+  "excluded_title_words": [
+    "Мебель"
+  ],
+  "excluded_employer_ids": [],
+  "work_formats": [
+    "REMOTE"
+  ]
+}
