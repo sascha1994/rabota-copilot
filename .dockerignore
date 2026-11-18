@@ -1,6 +1,9 @@
 **
 !Dockerfile
 !requirements.lock
+!requirements-browser.lock
+!deploy/
+!deploy/*.sh
 !search.example.json
 !app/
 !app/*.py
