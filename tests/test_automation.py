@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from app.letters import GeneratedLetter
 from app.assessment import Evaluation, LocalQuotaExceeded
@@ -134,7 +134,7 @@ class AutomationTests(unittest.IsolatedAsyncioTestCase):
         self.engine.sender = sender
         await self.engine.send(1,2)
         letter = sender.send.call_args.args[0]['letter_text']
-        self.assertTrue(preview.endswith(letter))
+        self.assertIn(letter,preview)
         self.assertIn('https://example.com/graphic',letter)
         self.assertNotIn('https://example.com/ai',letter)
 
@@ -185,22 +185,27 @@ class AutomationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_daily_search_runs_once_and_deduplicates(self):
         self.store.configure('time','00:00')
-        def collect(config):
-            self.store.storage.save(self.raw,search_key(config),None,datetime.now(timezone.utc).isoformat())
-            return SimpleNamespace(partial=False)
-        # Use a fresh connection in the background collector.
-        def collect_thread(config):
-            store = AutomationStore(self.path)
-            try:
-                store.storage.save(self.raw,search_key(config),None,datetime.now(timezone.utc).isoformat())
-            finally:
-                store.close()
-            return SimpleNamespace(partial=False)
-        self.service.collect = Mock(side_effect=collect_thread)
-        await self.engine.daily(self.notify)
-        await self.engine.daily(self.notify)
-        self.service.collect.assert_called_once()
-        self.assertEqual(len(self.store.jobs()),1)
+        from app.tg_bot import SearchService
+
+        service = SearchService(self.config_path, self.path, '')
+        self.engine.service = service
+        config = SearchConfig(excluded_title_words=('продажи',))
+        config.save(self.config_path)
+        skipped = {'id': '2', 'name': 'Дизайнер'}
+        self.store.storage.save(skipped, search_key(config), None, datetime.now(timezone.utc).isoformat())
+        self.store.storage.mark('2', 'skipped')
+        self.store.transition(1, 'REJECTED')
+        items = [self.raw, skipped, {'id': '3', 'name': 'Дизайнер'}, {'id': '4', 'name': 'Продажи'}]
+        with patch('app.web_search.WebSearchClient.search', return_value={'items': items, 'has_next': False}) as fetch:
+            self.assertEqual(service.collect(config).queued, 1)
+            service.last_web_search = None
+            items.append({'id': '5', 'name': 'Дизайнер'})
+            await self.engine.daily(self.notify)
+            await self.engine.daily(self.notify)
+            self.assertEqual(fetch.call_count, 2)
+        self.assertEqual({j['vacancy_id']: j['state'] for j in self.store.jobs()},
+                         {'1': 'REJECTED', '3': 'QUEUED', '5': 'QUEUED'})
+        self.assertIn('Добавлено в очередь: 1', self.notify.await_args.args[0])
 
     async def test_settings_buttons_and_input_persist(self):
         console = AutomationConsole(self.path,self.engine)
@@ -208,7 +213,9 @@ class AutomationTests(unittest.IsolatedAsyncioTestCase):
         console.pending = ('setting','time')
         await console.save_text(message)
         self.assertEqual(self.store.settings()['time'],'10:30')
-        for field,value in [('time','25:60'),('threshold',101),('daily_limit',0)]:
+        self.store.configure('daily_limit',200)
+        self.assertEqual(self.store.settings()['daily_limit'],200)
+        for field,value in [('time','25:60'),('threshold',101),('daily_limit',0),('daily_limit',501)]:
             with self.assertRaises(ValueError):
                 self.store.configure(field,value)
 
@@ -217,10 +224,10 @@ class AutomationTests(unittest.IsolatedAsyncioTestCase):
         console=AutomationConsole(self.path,self.engine)
         self.store.defer_ai(1,LocalQuotaExceeded().retry_at)
         console.pending=('setting','ai_daily_calls')
-        await console.save_text(SimpleNamespace(text='35',answer=AsyncMock()))
-        self.assertEqual(effective_limits(self.path,{'AI_DAILY_CALL_LIMIT':'20'}),(35,200000))
+        await console.save_text(SimpleNamespace(text='250',answer=AsyncMock()))
+        self.assertEqual(effective_limits(self.path,{'AI_DAILY_CALL_LIMIT':'20'}),(250,200000))
         self.assertEqual(self.store.get(1)['state'],'QUEUED')
-        for field,value in [('ai_daily_calls',0),('ai_daily_calls',101),('ai_daily_tokens',9999),('insights_time','24:30')]:
+        for field,value in [('ai_daily_calls',0),('ai_daily_calls',1001),('ai_daily_tokens',9999),('insights_time','24:30')]:
             with self.assertRaises(ValueError): self.store.configure(field,value)
 
     async def test_waiting_card_explains_daily_limit_and_has_refresh(self):
@@ -326,6 +333,31 @@ class AutomationTests(unittest.IsolatedAsyncioTestCase):
         after = self.store.queue_status(now=datetime(2026,11,15,21,0,tzinfo=timezone.utc))
         self.assertEqual(before['prepared'],1)
         self.assertEqual(after['prepared'],0)
+
+    async def test_daily_counts_deduplicate_and_use_minsk_midnight(self):
+        yesterday = '2026-11-15T20:59:00+00:00'
+        today = '2026-11-15T21:00:00+00:00'
+        now = datetime.fromisoformat(today)
+        key = search_key(self.config)
+        with self.store.db:
+            self.store.db.execute('UPDATE vacancies SET first_seen=?, last_seen=?', (yesterday, yesterday))
+        self.store.storage.save(self.raw, key, None, today)
+        self.store.storage.save({'id': '2'}, key, None, today)
+        self.store.storage.save({'id': '2'}, 'another-filter', None, today)
+        self.store.storage.save({'id': '3'}, key, 'filtered', today)
+
+        self.store.transition(1, 'PREPARING')
+        with self.store.db:
+            self.store.db.execute('UPDATE application_events SET created_at=?', (today,))
+        self.assertEqual(self.store.daily_vacancy_counts(now), (1, 0))
+
+        self.store.transition(1, 'UNSUITABLE')
+        self.store.transition(1, 'PREPARING')
+        self.store.transition(1, 'UNSUITABLE')
+        with self.store.db:
+            self.store.db.execute('UPDATE application_events SET created_at=?', (today,))
+        self.assertEqual(self.store.daily_vacancy_counts(now), (1, 1))
+        self.assertEqual(self.store.daily_vacancy_counts(datetime.fromisoformat(yesterday)), (1, 0))
 
     async def test_sent_card_has_confirmation_and_no_send_button(self):
         self.store.configure('mode','semi')

@@ -123,15 +123,12 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('SECRET', str(msg.answer.call_args))
         self.assertNotIn('SECRET', controller.last_result)
 
-    async def test_pagination_limits_cards_to_five(self):
-        service = Mock()
-        service.read.return_value = (None, [{'id': str(i), 'name': str(i)} for i in range(10)], 12, None)
-        controller = BotController(service, 42)
+    async def test_old_vacancies_link_opens_queue(self):
+        controller = BotController(Mock(), 42)
+        controller.automation.queue = AsyncMock()
         msg = message('/vacancies 2')
-        with patch('app.tg_bot.asyncio.sleep', new=AsyncMock()):
-            await controller.cards(msg, 2)
-        service.read.assert_called_once_with(10)
-        self.assertEqual(msg.answer.await_count, 7)  # heading, five cards, next page
+        await controller.handle(msg)
+        controller.automation.queue.assert_awaited_once_with(msg)
 
 
 class BotFormatTests(unittest.TestCase):

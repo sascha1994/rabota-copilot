@@ -5,7 +5,9 @@
   "salary": null,
   "currency": "BYR",
   "excluded_title_words": [
-    "Мебель"
+    "менеджер",
+    "мебель",
+    "game"
   ],
   "excluded_employer_ids": [],
   "work_formats": [

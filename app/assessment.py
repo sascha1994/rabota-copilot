@@ -61,10 +61,11 @@ class AssessmentError(RuntimeError):
 
 class LocalQuotaExceeded(AssessmentError):
     """No API request was made; work can resume after the local UTC reset."""
-    def __init__(self):
+    def __init__(self, detail=None):
         self.retry_at = (datetime.now(timezone.utc)+timedelta(days=1)).replace(
             hour=0,minute=0,second=0,microsecond=0).isoformat()
-        super().__init__('Достигнут локальный дневной лимит анализа. Кэшированные результаты остаются доступны.')
+        msg = detail or 'Достигнут локальный дневной лимит анализа. Кэшированные результаты остаются доступны.'
+        super().__init__(msg)
 
 
 def make_openai_opener(proxy_url):
@@ -259,14 +260,27 @@ class AssessmentService:
                 'input':[{'role':'developer','content':prompt},{'role':'user','content':inputs}],
                 'text':{'format':{'type':'json_schema','name':'vacancy_evaluation','strict':True,'schema':result_type.model_json_schema()}}}
             if model.startswith('gpt-5'): request_body['reasoning']={'effort':'low'}
-            body=json.dumps(request_body).encode()
-            # Conservative local reservation, not an account-wide billing guarantee.
-            reservation=len(body)+6500
+            json_text=json.dumps(request_body,ensure_ascii=False)
+            body=json_text.encode('utf-8')
+            # Conservative local token reservation (~1 token per 2 chars + max_output_tokens), without 6x \uXXXX inflation.
+            reservation=len(json_text)//2+4500
             day=datetime.now(timezone.utc).date().isoformat()
             db.execute('BEGIN IMMEDIATE')
             count,tokens=db.execute('SELECT count(*),coalesce(sum(tokens),0) FROM ai_call_usage WHERE day=?',(day,)).fetchone()
             if count>=daily_calls or tokens+reservation>daily_tokens:
-                db.rollback(); raise LocalQuotaExceeded()
+                db.rollback()
+                if count>=daily_calls:
+                    reason = (
+                        f'Достигнут локальный дневной лимит запросов OpenAI ({count}/{daily_calls}). '
+                        'Увеличьте «🤖 Запросы» в ⚙️ Автоматизация или дождитесь сброса в 03:00 по Минску.'
+                    )
+                else:
+                    reason = (
+                        f'Достигнут локальный дневной лимит токенов OpenAI '
+                        f'(использовано {tokens:,} из {daily_tokens:,}, резерв на запрос ~{reservation:,}). '
+                        'Увеличьте «🔢 Токены ИИ» в ⚙️ Автоматизация или дождитесь сброса в 03:00 по Минску.'
+                    ).replace(',', ' ')
+                raise LocalQuotaExceeded(reason)
             call_id=db.execute("INSERT INTO ai_call_usage(day,tokens,status) VALUES (?,?,'reserved')",(day,reservation)).lastrowid
             db.commit()
             request=Request('https://api.openai.com/v1/responses',data=body,headers={'Content-Type':'application/json'},method='POST')
@@ -315,11 +329,26 @@ class AssessmentService:
             profile.close();storage.close()
 
 
-def render_evaluation(result,cached):
-    text=f"Соответствие: {result.score}/100\nРезюме: {ROLES[result.resume]}\n\n{result.summary}"
+def render_evaluation(result, cached):
+    from .tg_ui import esc, score_badge
+
+    cache_tag = " · <i>из кэша</i>" if cached else ""
+    parts = [
+        f"🧠 <b>Оценка вакансии:</b> {score_badge(result.score)}{cache_tag}",
+        f"📄 <b>Рекомендуемое резюме:</b> {esc(ROLES[result.resume])}",
+        f"\n{esc(result.summary, 600)}",
+    ]
     if result.matches:
-        text+='\n\nСовпадения:\n'+'\n'.join('- '+m.reason+' ['+', '.join(m.fact_ids)+']' for m in result.matches)
-    for label,items in [('Расхождения',result.gaps),('Уточнить',result.questions)]:
-        if items: text+='\n\n'+label+':\n'+'\n'.join('- '+x for x in items)
-    suffix='\n\n'+('Из кэша. ' if cached else '')+'Оценка модели требует вашей проверки; это не вероятность найма.'
-    return text[:3800-len(suffix)]+suffix
+        items = "\n".join(
+            f"• {esc(m.reason, 280)} <code>[{esc(', '.join(m.fact_ids), 80)}]</code>"
+            for m in result.matches
+        )
+        parts.append(f"\n✅ <b>Совпадения:</b>\n{items}")
+    if result.gaps:
+        items = "\n".join(f"• {esc(x, 280)}" for x in result.gaps)
+        parts.append(f"\n⚠️ <b>Расхождения:</b>\n{items}")
+    if result.questions:
+        items = "\n".join(f"• {esc(x, 280)}" for x in result.questions)
+        parts.append(f"\n❓ <b>Уточнить:</b>\n{items}")
+    parts.append("\n<i>Оценка ИИ — ориентир для отбора, а не вероятность найма.</i>")
+    return "\n".join(parts)

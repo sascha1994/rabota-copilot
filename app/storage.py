@@ -41,7 +41,7 @@ class Storage:
     def close(self):
         self.db.close()
 
-    def save(self, item, search_key, rejection, now):
+    def save(self, item, search_key, rejection, now, *, on_match=None):
         employer = item.get("employer") or {}
         with self.db:
             exists = self.db.execute("SELECT 1 FROM vacancies WHERE id=?", (str(item["id"]),)).fetchone()
@@ -53,6 +53,8 @@ class Storage:
                     json.dumps(item, ensure_ascii=False), now, now))
             self.db.execute("INSERT INTO search_results VALUES (?, ?, ?) ON CONFLICT(search_key, vacancy_id) DO UPDATE SET rejection=excluded.rejection",
                             (search_key, str(item["id"]), rejection))
+            if rejection is None and on_match is not None:
+                on_match(item, search_key)
         return not exists
 
     def cursor(self, key):

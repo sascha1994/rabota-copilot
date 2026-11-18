@@ -12,7 +12,7 @@ def effective_limits(path, env):
             settings = json.loads(row[0]) if row else {}
         calls = int(settings.get('ai_daily_calls') or env.get('AI_DAILY_CALL_LIMIT','20'))
         tokens = int(settings.get('ai_daily_tokens') or env.get('AI_DAILY_TOKEN_LIMIT','200000'))
-        if not 1<=calls<=100 or not 10000<=tokens<=2000000:
+        if not 1<=calls<=1000 or not 10000<=tokens<=10000000:
             raise ValueError('Недопустимые локальные лимиты OpenAI.')
         return calls,tokens
     finally:

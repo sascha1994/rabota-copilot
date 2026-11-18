@@ -26,6 +26,7 @@ class Stats:
     rejected: int = 0
     requests: int = 0
     partial: bool = False
+    queued: int = 0
 
 
 class Collector:
@@ -35,7 +36,7 @@ class Collector:
         self.max_requests = max_requests
         self.should_stop = should_stop or (lambda: False)
 
-    def collect(self, *, days=1, now=None, full=False):
+    def collect(self, *, days=1, now=None, full=False, on_match=None):
         now = now or datetime.now(timezone.utc)
         end = floor_window(now)
         cursor = None if full else self.storage.cursor(self.key)
@@ -72,7 +73,7 @@ class Collector:
                         continue
                     seen.add(vid)
                     rejection = self.config.rejection(item)
-                    stats.new += self.storage.save(item, self.key, rejection, now.isoformat())
+                    stats.new += self.storage.save(item, self.key, rejection, now.isoformat(), on_match=on_match)
                     stats.received += 1
                     stats.rejected += rejection is not None
 

@@ -121,7 +121,7 @@ class WebCollector:
         self.should_stop = should_stop or (lambda: False)
         self.key = search_key(config)
 
-    def collect(self, *, days=1, now=None, full=False):
+    def collect(self, *, days=1, now=None, full=False, on_match=None):
         # HTML search has no reliable historical cursor: rescan the bounded period.
         now = now or datetime.now(timezone.utc)
         stats = Stats()
@@ -136,7 +136,7 @@ class WebCollector:
                     continue
                 seen.add(item["id"])
                 rejection = self.config.rejection(item)
-                stats.new += self.storage.save(item, self.key, rejection, now.isoformat())
+                stats.new += self.storage.save(item, self.key, rejection, now.isoformat(), on_match=on_match)
                 stats.received += 1
                 stats.rejected += rejection is not None
             stats.partial = data["has_next"]

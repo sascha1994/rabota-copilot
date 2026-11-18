@@ -105,8 +105,8 @@ class AutomationStore:
                 value = int(value)
             except (ValueError,TypeError):
                 raise ValueError('Введите целое число.') from None
-            low, high = {'threshold':(0,100),'daily_limit':(1,50),
-                         'ai_daily_calls':(1,100),'ai_daily_tokens':(10000,2000000),'browser_idle_minutes':(1,240)}[field]
+            low, high = {'threshold':(0,100),'daily_limit':(1,500),
+                         'ai_daily_calls':(1,1000),'ai_daily_tokens':(10000,10000000),'browser_idle_minutes':(1,240)}[field]
             if not low<=value<=high:
                 raise ValueError(f'Допустимо от {low} до {high}.')
         if field not in DEFAULTS:
@@ -142,6 +142,28 @@ class AutomationStore:
                 'reset':(local+timedelta(days=1)).replace(hour=0,minute=0,second=0,microsecond=0).strftime('%d.%m %H:%M'),
                 **settings}
 
+    def daily_vacancy_counts(self, now=None):
+        local = (now or datetime.now(timezone.utc)).astimezone(MINSK)
+        start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        bounds = tuple(day.astimezone(timezone.utc).isoformat()
+                       for day in (start, start + timedelta(days=1)))
+        found = self.db.execute("""
+            SELECT count(*) FROM vacancies v
+            WHERE v.first_seen >= ? AND v.first_seen < ?
+              AND EXISTS (SELECT 1 FROM search_results s
+                          WHERE s.vacancy_id = v.id AND s.rejection IS NULL)
+        """, bounds).fetchone()[0]
+        processed = self.db.execute("""
+            SELECT count(DISTINCT e.job_id) FROM application_events e
+            JOIN application_jobs j ON j.id = e.job_id
+            WHERE e.state = 'PREPARING' AND e.created_at >= ? AND e.created_at < ?
+              AND (j.state != 'PREPARING' OR e.id < (
+                  SELECT max(active.id) FROM application_events active
+                  WHERE active.job_id = e.job_id AND active.state = 'PREPARING'
+              ))
+        """, bounds).fetchone()[0]
+        return found, processed
+
     def finish_day(self, now, state):
         with self.db:
             self.db.execute('UPDATE automation_runs SET status=? WHERE day=?',
@@ -157,9 +179,19 @@ class AutomationStore:
 
     def enqueue(self, item, config_key, profile_hash):
         with self.db:
-            self.db.execute('INSERT OR IGNORE INTO application_jobs '
-                '(vacancy_id,state,config_key,profile_hash,raw_json,updated_at) VALUES (?,?,?,?,?,?)',
-                (str(item['id']),'QUEUED',config_key,profile_hash,json.dumps(item,ensure_ascii=False),datetime.now(timezone.utc).isoformat()))
+            return self.insert_job(item, config_key, profile_hash)
+
+    def insert_job(self, item, config_key, profile_hash):
+        cursor = self.db.execute("""
+            INSERT INTO application_jobs
+                (vacancy_id,state,config_key,profile_hash,raw_json,updated_at)
+            SELECT ?, 'QUEUED', ?, ?, ?, ?
+            WHERE NOT EXISTS (SELECT 1 FROM vacancy_tracking
+                              WHERE vacancy_id=? AND state IN ('skipped','applied'))
+            ON CONFLICT(vacancy_id) DO NOTHING
+        """, (str(item['id']), config_key, profile_hash, json.dumps(item, ensure_ascii=False),
+              datetime.now(timezone.utc).isoformat(), str(item['id'])))
+        return cursor.rowcount
 
     def get(self, ident):
         row = self.db.execute('SELECT * FROM application_jobs WHERE id=?',(ident,)).fetchone()
@@ -234,21 +266,9 @@ class AutomationEngine:
                 return
             try:
                 config = SearchConfig.load(self.service.config_path)
-                facts, digest = snapshot(self.service.db_path)
-                if not facts:
-                    raise ValueError('Подтвердите профиль перед ежедневной обработкой.')
                 stats = await asyncio.to_thread(self.service.collect, config)
-                # Process only cards observed in this collection, not the accumulated list.
-                rows = store.db.execute('''SELECT v.raw_json FROM vacancies v JOIN search_results s
-                    ON v.id=s.vacancy_id WHERE s.search_key=? AND s.rejection IS NULL AND v.last_seen>=?''',
-                    (search_key(config),now.isoformat())).fetchall()
-                for row in rows:
-                    item = json.loads(row[0])
-                    mark = store.db.execute('SELECT state FROM vacancy_tracking WHERE vacancy_id=?',(str(item['id']),)).fetchone()
-                    if not mark or mark[0] not in ('skipped','applied'):
-                        store.enqueue(item,search_key(config),digest)
                 store.finish_day(now,'PARTIAL' if stats.partial else 'DONE')
-                await notify('Ежедневный поиск завершён.' + (' Выдача частичная: достигнут лимит страниц.' if stats.partial else ''))
+                await notify(f'Ежедневный поиск завершён. Добавлено в очередь: {stats.queued}.' + (' Выдача частичная: достигнут лимит страниц.' if stats.partial else ''))
             except Exception:
                 store.finish_day(now,'FAILED')
                 await notify('Ежедневный поиск не завершён. Проверьте /status, фильтры и доступ к источнику. Сегодня автоматического повтора поиска не будет.')
@@ -270,12 +290,45 @@ class AutomationEngine:
                 return
             day_start = datetime.now(timezone.utc).astimezone(MINSK).replace(hour=0,minute=0,second=0,microsecond=0).astimezone(timezone.utc).isoformat()
             prepared = store.db.execute("SELECT count(*) FROM application_events WHERE state='PREPARING' AND created_at>=?",(day_start,)).fetchone()[0]
+            if prepared>=settings['daily_limit']:
+                return
+            current_key = search_key(SearchConfig.load(self.service.config_path))
+            facts, current_digest = snapshot(self.service.db_path)
+            if not facts:
+                return
+            # Batch-retire unprepared queued items from superseded search filters instead of dripping one per cycle.
+            stale_ids = [
+                r[0] for r in store.db.execute(
+                    "SELECT id FROM application_jobs WHERE state='QUEUED' AND package_revision IS NULL AND config_key!=?",
+                    (current_key,),
+                ).fetchall()
+            ]
+            for stale_id in stale_ids:
+                store.transition(
+                    stale_id,
+                    'STALE',
+                    expected=('QUEUED',),
+                    error='Фильтры поиска изменились до начала подготовки. Нажмите «Подготовить заново», если вакансия актуальна.',
+                )
             jobs = store.jobs(('QUEUED',),1)
-            if not jobs or prepared>=settings['daily_limit']:
+            if not jobs:
                 return
             job = jobs[0]; ident = job['id']
+            # Unprepared queued jobs from the active filter adopt the latest confirmed profile automatically.
+            if job['package_revision'] is None and job['config_key']==current_key and job['profile_hash']!=current_digest:
+                with store.db:
+                    store.db.execute(
+                        "UPDATE application_jobs SET profile_hash=? WHERE id=? AND state='QUEUED'",
+                        (current_digest, ident),
+                    )
+                job = store.get(ident)
             if not self.current(job):
-                store.transition(ident,'STALE',expected=('QUEUED',))
+                store.transition(
+                    ident,
+                    'STALE',
+                    expected=('QUEUED',),
+                    error='Фильтры поиска или профиль изменились. Нажмите «Подготовить заново».',
+                )
                 return
             mark = store.db.execute('SELECT state FROM vacancy_tracking WHERE vacancy_id=?',(job['vacancy_id'],)).fetchone()
             if mark and mark[0] in ('skipped','applied'):
@@ -318,6 +371,61 @@ class AutomationEngine:
             if ident is not None and store.get(ident)['state']=='PREPARING':
                 store.transition(ident,'FAILED',error=str(exc) if isinstance(exc,(AssessmentError,ValueError)) else 'Подготовка прервана. Проверьте профиль, доступ OpenAI и дневные лимиты.')
             await notify('Подготовка пакета не завершена. Подробности доступны в /queue. Повтор автоматически не выполняется.')
+        finally:
+            store.close()
+
+    async def force_prepare(self, ident, direction=None):
+        """Prepare a cover letter package bypassing score threshold (owner explicit override)."""
+        store = AutomationStore(self.service.db_path)
+        previous_state = None
+        previous_error = None
+        try:
+            job = store.get(ident)
+            if job['state'] not in ('UNSUITABLE', 'REJECTED', 'FAILED', 'STALE'):
+                raise ValueError('Задание уже подготовлено или находится в обработке.')
+            previous_state, previous_error = job['state'], job['error']
+            evaluation_data = json.loads(job['evaluation_json'] or '{}')
+            chosen_dir = direction or evaluation_data.get('resume')
+            if chosen_dir not in DIRECTIONS:
+                raise ValueError('Выберите направление резюме для принудительного отклика.')
+            mark = store.db.execute('SELECT state FROM vacancy_tracking WHERE vacancy_id=?', (job['vacancy_id'],)).fetchone()
+            if mark and mark[0] in ('skipped', 'applied'):
+                raise ValueError('Вакансия пропущена или уже отмечена как отклик.')
+            facts, digest = snapshot(self.service.db_path)
+            if not facts:
+                raise ValueError('Сначала подтвердите факты профиля в /profile.')
+            current_key = search_key(SearchConfig.load(self.service.config_path))
+            with store.db:
+                store.db.execute('BEGIN IMMEDIATE')
+                latest = store.get(ident)
+                if latest['state'] != previous_state:
+                    raise ValueError('Состояние задания изменилось. Откройте карточку заново.')
+                stamp = datetime.now(timezone.utc).isoformat()
+                store.db.execute(
+                    "UPDATE application_jobs SET state='PREPARING',config_key=?,profile_hash=?,error=NULL,updated_at=? WHERE id=?",
+                    (current_key, digest, stamp, ident),
+                )
+                store.db.execute("INSERT INTO application_events(job_id,state,created_at) VALUES (?,'PREPARING',?)", (ident, stamp))
+            ai = self.ai_factory(self.service.db_path, self.service.env)
+            result, _ = await asyncio.to_thread(ai.evaluate, job['vacancy_id'], application_direction=chosen_dir)
+            metadata = {
+                'direction': chosen_dir,
+                'questions': list(evaluation_data.get('questions', [])) + list(result.questions),
+                'gaps': list(evaluation_data.get('gaps', [])),
+                'forced': True,
+                'model': self.service.env.get('OPENAI_MODEL', 'gpt-5.4-mini'),
+            }
+            updated = store.save_package(ident, '', result.text, ai.description_id, metadata)
+            return updated['package_revision']
+        except Exception as exc:
+            if previous_state is not None:
+                try:
+                    if store.get(ident)['state'] == 'PREPARING':
+                        err = str(exc) if isinstance(exc, (AssessmentError, ValueError)) else previous_error
+                        store.transition(ident, previous_state, expected=('PREPARING',), error=err)
+                except Exception:
+                    pass
+            raise
         finally:
             store.close()
 
