@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 import json
 import logging
+import re
 from pathlib import Path
 import secrets
 import threading
@@ -24,7 +25,7 @@ from aiogram.types import (
 )
 from aiogram.utils.token import TokenValidationError, validate_token
 
-from .assessment import DIRECTIONS, AssessmentError, AssessmentService, LocalQuotaExceeded, render_evaluation
+from .assessment import DIRECTIONS, AssessmentError, AssessmentService, LocalQuotaExceeded, load_vacancy_page, render_evaluation
 from .automation import AutomationEngine, AutomationStore, MINSK
 from .candidate_profile import ProfileStore
 from .collector import search_key
@@ -52,6 +53,7 @@ from .web_search import WebSearchError
 
 HELP = (
     "🤖 <b>Работа BY · Личный пульт</b>\n\n"
+    "Пришлите ссылку на вакансию rabota.by отдельным сообщением, чтобы добавить её в очередь.\n\n"
     "<b>Основные разделы (кнопки внизу экрана):</b>\n"
     "• <b>📥 Очередь</b> (<code>/queue</code>) — проверка, правка и отправка откликов\n"
     "• <b>🔍 Найти вакансии</b> (<code>/search</code>) — добавить новые вакансии в очередь\n"
@@ -241,6 +243,31 @@ class SearchService:
             stats = collector.collect(on_match=enqueue)
             stats.queued = queued
             return stats
+        finally:
+            store.close()
+
+    def add_link(self, vid):
+        store = AutomationStore(self.db_path)
+        try:
+            query = 'SELECT id FROM application_jobs WHERE vacancy_id=?'
+            existing = store.db.execute(query, (vid,)).fetchone()
+            if existing:
+                return existing['id'], False
+            saved = store.db.execute('SELECT raw_json FROM vacancies WHERE id=?', (vid,)).fetchone()
+            if saved:
+                item = json.loads(saved['raw_json'])
+            else:
+                title, _ = load_vacancy_page(vid)
+                item = {'id': vid, 'name': title, 'alternate_url': 'https://rabota.by/vacancy/' + vid}
+            key = search_key(SearchConfig.load(self.config_path))
+            _, digest = snapshot(self.db_path)
+            with store.db:
+                store.db.execute('BEGIN IMMEDIATE')
+                added = store.insert_job(item, key, digest)
+                job = store.db.execute(query, (vid,)).fetchone()
+                if added and not store.db.execute('SELECT 1 FROM vacancies WHERE id=?', (vid,)).fetchone():
+                    store.storage.save(item, 'manual', None, datetime.now(timezone.utc).isoformat())
+            return job['id'] if job else None, bool(added)
         finally:
             store.close()
 
@@ -945,6 +972,23 @@ class BotController:
                 await render(message, HELP, reply_markup=KEYBOARD)
             elif command == "/search":
                 await self.start_search(message)
+            elif raw_text.strip().lower().startswith(("http://", "https://", "rabota.by/", "www.rabota.by/")):
+                match = re.fullmatch(r'(?:https?://)?(?:www\.)?rabota\.by/vacancy/([0-9]{1,15})/?(?:[?#]\S*)?',
+                                     raw_text.strip(), re.IGNORECASE)
+                if not match:
+                    await render(message, "Пришлите одну ссылку вида https://rabota.by/vacancy/123456.")
+                    return
+                try:
+                    ident, added = await asyncio.to_thread(self.service.add_link, match[1])
+                except AssessmentError as exc:
+                    await render(message, esc(str(exc)))
+                    return
+                if ident is None:
+                    await render(message, "Вакансия ранее пропущена или отмечена как отклик вручную.")
+                    return
+                status = "Добавлено в очередь" if added else "Уже в очереди"
+                await render(message, f"{status} · задание #{ident}",
+                             reply_markup=inline_kb([[("Открыть карточку", f"flow:view:{ident}")]]))
             elif command == "/clear":
                 self.pending_field = None
                 await self.ask_clear(message)

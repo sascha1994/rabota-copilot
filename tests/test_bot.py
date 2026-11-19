@@ -1,9 +1,13 @@
 import asyncio
+import tempfile
+from pathlib import Path
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from app.tg_bot import BotController, admin_id_from_env, vacancy_card
+from app.tg_bot import BotController, SearchService, admin_id_from_env, vacancy_card
+from app.automation import AutomationStore
+from app.config import SearchConfig
 from app.hh_client import ApiError
 
 
@@ -13,6 +17,30 @@ def message(text, uid=42, chat_type="private"):
 
 
 class BotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_owner_link_creates_persistent_job_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            SearchConfig().save(path / 'search.json')
+            service = SearchService(path / 'search.json', path / 'jobs.sqlite3', '')
+            bot = BotController(service, 42)
+            msg = message('https://rabota.by/vacancy/123?from=share')
+            with patch('app.tg_bot.load_vacancy_page', return_value=('Дизайнер', 'Описание')) as fetch:
+                await bot.handle(message(msg.text, uid=99))
+                await bot.handle(message('https://rabota.by.example.org/vacancy/123'))
+                fetch.assert_not_called()
+                await bot.handle(msg)
+                self.assertIn('Добавлено в очередь', msg.answer.call_args.args[0])
+                await bot.handle(msg)
+                self.assertIn('Уже в очереди', msg.answer.call_args.args[0])
+                fetch.assert_called_once_with('123')
+            store = AutomationStore(service.db_path)
+            try:
+                self.assertEqual(store.jobs()[0]['state'], 'QUEUED')
+                row = store.db.execute('SELECT title,url FROM vacancies').fetchone()
+                self.assertEqual(tuple(row), ('Дизайнер', 'https://rabota.by/vacancy/123'))
+            finally:
+                store.close()
+
     async def test_send_button_starts_one_operation_and_blocks_stranger(self):
         from aiogram.types import Message
         controller = BotController(Mock(),42)

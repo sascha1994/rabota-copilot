@@ -134,8 +134,12 @@ def openai_http_error(status, body):
 class DescriptionParser(HTMLParser):
     def __init__(self):
         super().__init__(); self.depth=0; self.parts=[]
+        self.title = ''
 
     def handle_starttag(self,tag,attrs):
+        attributes = dict(attrs)
+        if tag == 'meta' and attributes.get('property') == 'og:title':
+            self.title = (attributes.get('content') or '').strip()
         if self.depth:
             if tag not in ('br','hr','img','input','meta','link','wbr','source'):
                 self.depth+=1
@@ -151,7 +155,7 @@ class DescriptionParser(HTMLParser):
         if self.depth: self.parts.append(data)
 
 
-def load_description(vid, opener=urlopen):
+def load_vacancy_page(vid, opener=urlopen):
     if not re.fullmatch(r'[0-9]{1,15}',vid):
         raise AssessmentError('Некорректный ID вакансии.')
     request=Request('https://rabota.by/vacancy/'+vid,headers={'User-Agent':'RabotaCopilot/0.1'})
@@ -165,9 +169,13 @@ def load_description(vid, opener=urlopen):
             raise AssessmentError('Полное описание недоступно: вакансия закрыта, изменилась страница или требуется проверка доступа.')
         if len(text)>24000:
             raise AssessmentError('Описание длиннее 24000 символов; автоматическая оценка остановлена.')
-        return text
+        return parser.title or f'Вакансия №{vid}', text
     except (HTTPError,URLError,TimeoutError,OSError,UnicodeError):
         raise AssessmentError('Не удалось получить описание rabota.by. Повторите позднее.') from None
+
+
+def load_description(vid, opener=urlopen):
+    return load_vacancy_page(vid, opener)[1]
 
 
 def professional_facts(facts):
