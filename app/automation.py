@@ -534,7 +534,7 @@ class AutomationEngine:
                 if not receipt:
                     raise RuntimeError('No verified receipt')
             except Exception as exc:
-                from .browser_sender import BrowserVerificationRequired, SubmissionBlocked
+                from .browser_sender import BrowserVerificationRequired, SubmissionBlocked, SubmissionUnknown
                 if isinstance(exc,BrowserVerificationRequired):
                     store.configure('browser_hold',True)
                     state = 'UNKNOWN' if exc.outcome_unknown else 'BLOCKED'
@@ -543,6 +543,9 @@ class AutomationEngine:
                         message += ' После нажатия результат неизвестен. Проверьте отклики на сайте. Повтор этой отправки заблокирован.'
                     store.transition(ident,state,expected=('SENDING',),error=message)
                     return message
+                if isinstance(exc, SubmissionUnknown):
+                    store.transition(ident,'UNKNOWN',expected=('SENDING',),error=str(exc))
+                    return str(exc)
                 if isinstance(exc,SubmissionBlocked):
                     store.transition(ident,'BLOCKED',error=str(exc))
                     return str(exc)

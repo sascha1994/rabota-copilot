@@ -2,7 +2,7 @@ import asyncio
 import json
 import tempfile
 import unittest
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import call, Mock, MagicMock, patch
 from threading import get_ident
 
 from app.browser_sender import BrowserSender, SeriesBrowserSender, BrowserVerificationRequired, SubmissionBlocked, SUCCESS_TEXT, FOREIGN_WARNING, FOREIGN_CONTINUE, RESPONSE_LINK
@@ -22,6 +22,7 @@ class BrowserSenderTests(unittest.TestCase):
     def context(self):
         page = Mock()
         warning = Mock()
+        warning.filter.return_value = warning
         warning.is_visible.return_value = False
         page.get_by_text.side_effect = lambda pattern,**kwargs: warning if pattern is FOREIGN_WARNING else page.get_by_text.return_value
         field = Mock()
@@ -67,17 +68,27 @@ class BrowserSenderTests(unittest.TestCase):
         self.assertTrue(launch.call_args.kwargs['chromium_sandbox'])
         self.assertEqual(len(receipt['letter_hash']),64)
         self.assertNotIn('resume_hash',receipt)
-        submit.click.assert_called_once()
+        self.assertEqual(submit.click.call_args_list, [call(trial=True), call()])
 
     def test_error_after_click_is_ambiguous(self):
         manager,page,field,submit = self.context()
-        page.get_by_text.return_value.first.wait_for.side_effect = TimeoutError()
+        page.get_by_text.return_value.filter.return_value.first.wait_for.side_effect = TimeoutError()
         with patch('playwright.sync_api.sync_playwright',return_value=manager), \
              patch.object(self.sender,'guard'), \
              patch.object(self.sender,'_open_response',return_value=field):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaisesRegex(RuntimeError, 'ожидание подтверждения.*TimeoutError'):
                 self.sender.send(self.package)
-        submit.click.assert_called_once()
+        self.assertEqual(submit.click.call_args_list, [call(trial=True), call()])
+
+    def test_obstructed_submit_stops_before_dispatch(self):
+        manager, page, field, submit = self.context()
+        submit.click.side_effect = TimeoutError()
+        with patch('playwright.sync_api.sync_playwright', return_value=manager), \
+             patch.object(self.sender, 'guard'), \
+             patch.object(self.sender, '_open_response', return_value=field):
+            with self.assertRaisesRegex(SubmissionBlocked, 'до нажатия.*доступности кнопки'):
+                self.sender.send(self.package)
+        submit.click.assert_called_once_with(trial=True)
 
     def test_pause_guard_prevents_final_click(self):
         manager,page,field,submit = self.context()
@@ -87,7 +98,7 @@ class BrowserSenderTests(unittest.TestCase):
              patch.object(self.sender,'_open_response',return_value=field):
             with self.assertRaises(SubmissionBlocked):
                 self.sender.send(self.package)
-        submit.click.assert_not_called()
+        submit.click.assert_called_once_with(trial=True)
 
     def test_guard_rejects_login_redirect_and_new_consent(self):
         page = Mock(url='https://account.hh.ru/login')
@@ -118,7 +129,7 @@ class BrowserSenderTests(unittest.TestCase):
         with patch.object(self.sender,'guard'):
             self.sender._continue_foreign_warning(page,before)
         before.assert_called_once()
-        button.click.assert_called_once()
+        self.assertEqual(button.click.call_args_list, [call(trial=True), call()])
         title.wait_for.assert_called_once_with(state='hidden',timeout=15000)
         for label in ('Все равно откликнуться','Всё равно откликнуться'):
             self.assertIsNotNone(FOREIGN_CONTINUE.fullmatch(label))
@@ -133,7 +144,7 @@ class BrowserSenderTests(unittest.TestCase):
         page,title,button = self.warning_page()
         with patch.object(self.sender,'guard'),self.assertRaises(SubmissionBlocked):
             self.sender._continue_foreign_warning(page,Mock(side_effect=SubmissionBlocked('Пауза')))
-        button.click.assert_not_called()
+        button.click.assert_called_once_with(trial=True)
 
     def test_foreign_warning_after_submit_requires_success(self):
         manager,page,field,submit = self.context()
@@ -145,7 +156,7 @@ class BrowserSenderTests(unittest.TestCase):
              patch.object(self.sender,'_continue_foreign_warning') as proceed:
             receipt = self.sender.send(self.package)
         proceed.assert_called_once()
-        submit.click.assert_called_once()
+        self.assertEqual(submit.click.call_args_list, [call(trial=True), call()])
         self.assertEqual(receipt['vacancy_id'],'123')
 
     def test_foreign_warning_before_form_is_handled(self):

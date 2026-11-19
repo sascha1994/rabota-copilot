@@ -28,6 +28,10 @@ MANUAL_CHECK = re.compile(
 class SubmissionBlocked(ValueError):
     """The final submit control has not been clicked; a manual retry is possible."""
 
+class SubmissionUnknown(RuntimeError):
+    """A potentially submitting click was attempted without a verified receipt."""
+
+
 class BrowserVerificationRequired(SubmissionBlocked):
     def __init__(self, *, outcome_unknown=False, window_open=False):
         self.outcome_unknown = outcome_unknown
@@ -98,6 +102,7 @@ class BrowserSender:
                                     'кнопку продолжения отклика в другой стране')
         if before_continue is None:
             raise SubmissionBlocked('Обнаружено предупреждение о другой стране. Проверка без отправки остановлена.')
+        button.click(trial=True)
         before_continue()
         button.click()
         title.wait_for(state='hidden',timeout=15000)
@@ -170,12 +175,14 @@ class BrowserSender:
         resume_id = self.validate(package)
         submitted = False
         window_open = False
+        self.stage = 'запуск браузера'
         try:
             with self._browser_context() as context:
                 page = None
                 try:
                     page = context.pages[0] if context.pages else context.new_page()
                     page.set_default_timeout(15000)
+                    self.stage = 'открытие вакансии'
                     page.goto('https://rabota.by/vacancy/'+str(package['vacancy_id']),wait_until='domcontentloaded')
                     self.guard(page)
                     def before_warning():
@@ -183,20 +190,28 @@ class BrowserSender:
                         if package.get('_before_submit'):
                             package['_before_submit']()
                         # Treat continuation conservatively: the site may submit on this click.
+                        self.stage = 'подтверждение отклика в другой стране'
                         submitted = True
+                    self.stage = 'открытие формы отклика'
                     field = self._open_response(page,resume_id,before_warning=before_warning)
                     field.fill(package['letter_text'])
                     if field.input_value()!=package['letter_text']:
                         raise SubmissionBlocked('Текст письма не совпал с пакетом.')
                     self.guard(page)
                     submit = self._only_visible(page.locator('[data-qa="vacancy-response-submit-popup"]'),'кнопку отправки формы')
+                    self.stage = 'проверка доступности кнопки отправки'
+                    if not submit.is_enabled():
+                        raise SubmissionBlocked('Кнопка отправки недоступна. Проверьте обязательные поля формы на сайте.')
+                    submit.click(trial=True)
                     if package.get('_before_submit'):
                         package['_before_submit']()
+                    self.stage = 'нажатие кнопки отправки'
                     submitted = True  # Any failure after the click may be an actual submission.
                     submit.click()
+                    self.stage = 'ожидание подтверждения от rabota.by'
                     self._browser_verification(page)
-                    success = page.get_by_text(SUCCESS_TEXT)
-                    warning = page.get_by_text(FOREIGN_WARNING)
+                    success = page.get_by_text(SUCCESS_TEXT).filter(visible=True)
+                    warning = page.get_by_text(FOREIGN_WARNING).filter(visible=True)
                     success.or_(warning).first.wait_for(state='visible',timeout=20000)
                     if warning.is_visible():
                         self._continue_foreign_warning(page,before_warning)
@@ -229,14 +244,14 @@ class BrowserSender:
                     raise
         except BrowserVerificationRequired:
             raise BrowserVerificationRequired(outcome_unknown=submitted,window_open=window_open) from None
-        except SubmissionBlocked:
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc, SubmissionBlocked) else type(exc).__name__
             if submitted:
-                raise RuntimeError('Submission outcome unknown') from None
-            raise
-        except Exception:
-            if submitted:
-                raise RuntimeError('Submission outcome unknown') from None
-            raise SubmissionBlocked('Отклик не отправлялся. Проверьте вход, браузерную сессию и форму сайта. Если окно browser-login открыто, закройте его.') from None
+                raise SubmissionUnknown(f'Этап: {self.stage}. {reason}. Подтверждение доставки не получено. '
+                                        'Проверьте «Отклики» на rabota.by перед повтором.') from None
+            if isinstance(exc, SubmissionBlocked):
+                raise
+            raise SubmissionBlocked(f'Отправка остановлена до нажатия кнопки. Этап: {self.stage}. {reason}.') from None
 
     def check(self, package, *, status_only=False):
         """Verify the existing resume selection and response controls without submitting."""
