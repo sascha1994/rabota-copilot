@@ -117,6 +117,26 @@ class AutomationTests(unittest.IsolatedAsyncioTestCase):
             await self.engine.send(1,1)
         sender.send.assert_called_once()
 
+    async def test_unknown_rework_requires_confirmation_and_invalidates_old_send(self):
+        self.store.configure('mode','semi')
+        await self.engine.prepare_one(self.notify)
+        self.store.transition(1, 'UNKNOWN')
+        console = AutomationConsole(self.path, self.engine)
+        msg = SimpleNamespace(answer=AsyncMock(), edit_text=AsyncMock())
+        callback = SimpleNamespace(message=msg, data='flow:rework:1:1', answer=AsyncMock())
+        await console.callback(callback)
+        self.assertEqual(self.store.get(1)['state'], 'UNKNOWN')
+        keyboard = msg.edit_text.call_args.kwargs['reply_markup']
+        callback.data = keyboard.inline_keyboard[0][0].callback_data
+        await console.callback(callback)
+        self.assertEqual(self.store.get(1)['state'], 'REVIEW')
+        self.assertEqual(self.store.get(1)['package_revision'], 2)
+        self.assertEqual(self.store.package(1, 2)['letter_text'], self.store.package(1, 1)['letter_text'])
+        with self.assertRaises(ValueError):
+            await console.callback(callback)
+        with self.assertRaises(ValueError):
+            await self.engine.send(1, 1)
+
     async def test_portfolio_in_preview_matches_outgoing_letter_without_resume_draft(self):
         self.store.configure('mode','semi')
         self.service.env.update(PORTFOLIO_GRAPHIC='https://example.com/graphic',

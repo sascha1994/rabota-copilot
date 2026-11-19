@@ -374,6 +374,8 @@ class AutomationConsole:
         if job["state"] in ("FAILED", "STALE", "REVIEW", "READY", "BLOCKED"):
             secondary_row.append(("🔄 Подготовить заново", f"flow:retry:{ident}"))
         revision = job["package_revision"] or 0
+        if revision and job["state"] in ("UNKNOWN", "UNKNOWN_DISMISSED"):
+            actions.append([("✏️ Вернуть на доработку", f"flow:rework:{ident}:{revision}")])
         if job["state"] in REJECTABLE:
             secondary_row.append(("✖️ Отклонить", f"flow:reject:{ident}:{revision}"))
         elif job["state"] == "UNKNOWN":
@@ -554,7 +556,21 @@ class AutomationConsole:
                 return
             if len(parts) != 4 or int(parts[3]) != (job["package_revision"] or 0):
                 raise ValueError("Версия пакета изменилась. Откройте очередь заново.")
-            if action == "reject":
+            if action == "rework":
+                if job["state"] not in ("UNKNOWN", "UNKNOWN_DISMISSED"):
+                    raise ValueError("Состояние изменилось. Откройте карточку заново.")
+                await callback.answer()
+                await render(callback.message,
+                             f"Проверьте раздел «Отклики» на rabota.by для задания #{ident}. "
+                             "Если отклика там нет, подтвердите возврат. Бот создаст новую версию письма для ручной проверки.",
+                             edit=True, reply_markup=buttons([
+                                 [("Проверил: отклика нет", f"flow:reopen:{ident}:{parts[3]}")],
+                                 [("← Назад", f"flow:view:{ident}")],
+                             ]))
+                return
+            if action == "reopen":
+                store.reopen_after_verification(ident, int(parts[3]))
+            elif action == "reject":
                 store.transition(ident, "REJECTED", expected=REJECTABLE, expected_revision=int(parts[3]))
             elif action == "dismiss":
                 store.transition(

@@ -225,6 +225,22 @@ class AutomationStore:
             raise ValueError('Пакет ещё не подготовлен.')
         return dict(row)
 
+    def reopen_after_verification(self, ident, revision):
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            job = self.get(ident)
+            if job['state'] not in ('UNKNOWN', 'UNKNOWN_DISMISSED') or job['package_revision'] != revision:
+                raise ValueError('Состояние или версия изменились. Откройте карточку заново.')
+            package = self.package(ident, revision)
+            stamp = datetime.now(timezone.utc).isoformat()
+            self.db.execute('INSERT INTO application_packages VALUES (?,?,?,?,?,?)',
+                            (ident, revision + 1, package['resume_text'], package['letter_text'],
+                             package['description_id'], package['metadata_json']))
+            self.db.execute("UPDATE application_jobs SET state='REVIEW',package_revision=?,error=NULL,updated_at=? WHERE id=?",
+                            (revision + 1, stamp, ident))
+            self.db.execute("INSERT INTO application_events(job_id,state,created_at) VALUES (?,'REVIEW',?)",
+                            (ident, stamp))
+
     def save_package(self, ident, resume, letter, description_id, metadata, *, expected_revision=None):
         if len(resume)>18000 or not 1<=len(letter.strip())<=LETTER_LIMIT:
             raise ValueError('Письмо должно содержать от 1 до 1800 символов.')
