@@ -53,7 +53,7 @@ from .web_search import WebSearchError
 
 HELP = (
     "🤖 <b>Работа BY · Личный пульт</b>\n\n"
-    "Пришлите ссылку на вакансию rabota.by отдельным сообщением, чтобы добавить её в очередь.\n\n"
+    "Пришлите ссылку на вакансию hh.ru или rabota.by отдельным сообщением, чтобы добавить её в очередь.\n\n"
     "<b>Основные разделы (кнопки внизу экрана):</b>\n"
     "• <b>📥 Очередь</b> (<code>/queue</code>) — проверка, правка и отправка откликов\n"
     "• <b>🔍 Найти вакансии</b> (<code>/search</code>) — добавить новые вакансии в очередь\n"
@@ -972,11 +972,11 @@ class BotController:
                 await render(message, HELP, reply_markup=KEYBOARD)
             elif command == "/search":
                 await self.start_search(message)
-            elif raw_text.strip().lower().startswith(("http://", "https://", "rabota.by/", "www.rabota.by/")):
-                match = re.fullmatch(r'(?:https?://)?(?:www\.)?rabota\.by/vacancy/([0-9]{1,15})/?(?:[?#]\S*)?',
+            elif raw_text.strip().lower().startswith(("http://", "https://", "rabota.by/", "www.rabota.by/", "hh.ru/", "www.hh.ru/")):
+                match = re.fullmatch(r'(?:https?://)?(?:www\.)?(?:rabota\.by|hh\.ru)/vacancy/([0-9]{1,15})/?(?:[?#]\S*)?',
                                      raw_text.strip(), re.IGNORECASE)
                 if not match:
-                    await render(message, "Пришлите одну ссылку вида https://rabota.by/vacancy/123456.")
+                    await render(message, "Пришлите одну ссылку вида https://hh.ru/vacancy/123456 или https://rabota.by/vacancy/123456.")
                     return
                 try:
                     ident, added = await asyncio.to_thread(self.service.add_link, match[1])
