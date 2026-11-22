@@ -56,6 +56,26 @@ class AssessmentTests(unittest.TestCase):
         self.assertTrue(self.service.evaluate('1',application_direction='graphic')[1])
         self.assertEqual(len(self.calls),1)
 
+    def test_letter_uses_at_most_two_confirmed_matches_from_same_description(self):
+        self.result['matches'] = [
+            {'reason': reason, 'fact_ids': ['skill']}
+            for reason in ('Первая задача', 'Вторая задача', 'Третья задача')
+        ]
+        evaluation, _ = self.service.evaluate('1')
+        options = dict(application_direction='graphic', assessment_matches=evaluation.matches,
+                       assessed_description_id=self.service.description_id)
+        self.result = {'text':'Есть опыт графического дизайна.','fact_ids':['skill'],'questions':[]}
+        self.service.evaluate('1', **options)
+        payload = json.loads(json.loads(self.calls[-1].data)['input'][1]['content'])
+        self.assertEqual(payload['assessment_matches'], [m.model_dump() for m in evaluation.matches[:2]])
+        self.assertTrue(self.service.evaluate('1', **options)[1])
+        self.assertEqual(len(self.calls), 2)
+
+        self.service.details = lambda vid: 'Другое подробное описание вакансии.'
+        self.service.evaluate('1', **options)
+        payload = json.loads(json.loads(self.calls[-1].data)['input'][1]['content'])
+        self.assertNotIn('assessment_matches', payload)
+
     def test_application_package_rejects_invented_letter_fact(self):
         self.result = {'text':'Руковожу командой.','fact_ids':['invented'],'questions':[]}
         with self.assertRaises(AssessmentError):

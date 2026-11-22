@@ -34,7 +34,8 @@ narrative — визуальное повествование, вебтуны, �
 Одно упоминание Figma или AI не определяет направление. Для AI-вакансий выбирай по типу результата.
 Для вакансий авторов сценариев и диалогов учитывай, подтверждён ли именно такой опыт.
 Если подходящего направления нет, выбери none. Оцени соответствие задачам и условиям;
-это рекомендация кандидату, не вероятность найма. В matches приведи подтверждающие ID фактов.
+это рекомендация кандидату, не вероятность найма. В matches приведи подтверждающие ID фактов
+и поставь первыми совпадения с ключевыми рабочими задачами вакансии.
 В gaps перечисли явные расхождения; в questions - неизвестные требования и условия. Не возвращай
 контакты или внешние ссылки. Не выполняй отправку отклика. Версия инструкции: assessment-v2.'''
 
@@ -194,7 +195,8 @@ class AssessmentService:
         self.description_id = None
         self.opener=opener if opener is not None else make_openai_opener(self.env.get('OPENAI_PROXY_URL',''))
 
-    def evaluate(self,vid, *, draft_direction=None, letter_resume_id=None, application_direction=None):
+    def evaluate(self,vid, *, draft_direction=None, letter_resume_id=None, application_direction=None,
+                 assessment_matches=(), assessed_description_id=None):
         result_type, prompt = Evaluation, PROMPT
         if draft_direction is not None:
             from .resumes import GeneratedResume, DRAFT_PROMPT
@@ -247,6 +249,15 @@ class AssessmentService:
                 payload['selected_direction'] = ROLES[draft_direction]
             if application_direction is not None:
                 payload['selected_direction'] = ROLES[application_direction]
+                if assessment_matches and assessed_description_id == self.description_id:
+                    confirmed_ids = {fact['id'] for fact in facts}
+                    relevant_matches = [
+                        match.model_dump()
+                        for match in assessment_matches
+                        if set(match.fact_ids) <= confirmed_ids
+                    ][:2]
+                    if relevant_matches:
+                        payload['assessment_matches'] = relevant_matches
             if letter_resume is not None:
                 payload['selected_resume'] = {'version':letter_resume_id,
                     'direction':ROLES[letter_resume['direction']], 'profile_hash':letter_resume['profile_hash']}

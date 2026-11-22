@@ -359,7 +359,10 @@ class AutomationEngine:
                 store.transition(ident,'UNSUITABLE',expected=('PREPARING',))
                 return
             evaluated_description = ai.description_id
-            result, _ = await asyncio.to_thread(ai.evaluate,job['vacancy_id'],application_direction=evaluation.resume)
+            result, _ = await asyncio.to_thread(
+                ai.evaluate, job['vacancy_id'], application_direction=evaluation.resume,
+                assessment_matches=evaluation.matches, assessed_description_id=evaluated_description,
+            )
             if not self.current(job):
                 store.transition(ident,'STALE',expected=('PREPARING',))
                 return
